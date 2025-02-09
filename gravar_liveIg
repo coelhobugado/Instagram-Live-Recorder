@@ -1,0 +1,344 @@
+// ==UserScript==
+// @name         Instagram Live Recorder
+// @namespace    http://tampermonkey.net/
+// @version      0.3
+// @description  Grava lives do Instagram
+// @author       CoelhoBugado
+// @match        https://www.instagram.com/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_notification
+// @grant        GM_openInTab
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // Configurações padrão otimizadas para alta qualidade
+    const DEFAULT_SETTINGS = {
+        format: 'webm',
+        autoStart: false,
+        notificationsEnabled: true,
+        isPanelCollapsed: false,
+        maxFileSizeGB: 2,
+        splitRecordingEnabled: true,
+        recordAudioOnly: false,
+        videoBitrate: 8000000, // 8 Mbps para máxima qualidade
+        audioBitrate: 256000   // 256 kbps para áudio
+    };
+
+    // Função para carregar configurações
+    function loadSettings() {
+        return {
+            ...DEFAULT_SETTINGS,
+            ...GM_getValue('liveRecorderSettings', {})
+        };
+    }
+
+    // Interface de controle simplificada
+    function createControlPanel() {
+        const panel = document.createElement('div');
+        panel.id = 'live-recorder-panel';
+        const settings = loadSettings();
+
+        // Estilo base do painel com tema claro/escuro
+        panel.style.cssText = `
+            position: fixed;
+            top: 80px;
+            right: 20px;
+            z-index: 9999;
+            background: ${isDarkMode() ? 'rgba(0, 0, 0, 0.9)' : 'rgba(255, 255, 255, 0.9)'};
+            padding: 15px;
+            border-radius: 10px;
+            color: ${isDarkMode() ? 'white' : 'black'};
+            font-family: Arial, sans-serif;
+            min-width: 250px;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            backdrop-filter: blur(5px);
+        `;
+
+        // Interface simplificada focada em qualidade
+        const contentHtml = `
+            <div class="panel-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                <h3 style="margin: 0;">📹 Live Recorder HD</h3>
+                <div class="controls">
+                    <button class="minimize-btn" style="background: none; border: none; color: inherit; cursor: pointer;">_</button>
+                    <span class="collapse-arrow" style="transform: ${settings.isPanelCollapsed ? 'rotate(-90deg)' : 'rotate(0deg)'};">▼</span>
+                </div>
+            </div>
+            <div class="panel-content" style="display: ${settings.isPanelCollapsed ? 'none' : 'block'};">
+                <div class="status-section" style="margin-bottom: 15px;">
+                    <div id="recording-status" class="status-indicator" style="display: none;">
+                        <span class="pulse"></span> Gravando em HD
+                    </div>
+                    <div id="recording-time" style="display: none;">
+                        Tempo: <span>00:00:00</span>
+                    </div>
+                    <div id="file-size" style="display: none;">
+                        Tamanho: <span>0 MB</span>
+                    </div>
+                    <div id="bandwidth" style="display: none;">
+                        Taxa: <span>0 Mbps</span>
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <div class="setting-group" style="margin-bottom: 10px;">
+                        <label>
+                            <input type="checkbox" id="split-recording" ${settings.splitRecordingEnabled ? 'checked' : ''}>
+                            Dividir gravação automaticamente
+                        </label>
+                        <input type="number" id="max-file-size" value="${settings.maxFileSizeGB}" min="1" max="10" step="0.5"
+                            style="width: 60px; margin-left: 10px;"> GB
+                    </div>
+
+                    <div class="setting-group">
+                        <label>
+                            <input type="checkbox" id="auto-start" ${settings.autoStart ? 'checked' : ''}>
+                            Iniciar gravação automaticamente
+                        </label>
+                    </div>
+                </div>
+
+                <div id="error-message" style="color: #ff4444; margin-top: 5px; display: none;"></div>
+            </div>
+
+            <div class="button-group" style="display: flex; gap: 10px; margin-top: 10px;">
+                <button id="record-live-btn" class="primary-btn" style="flex: 1;">
+                    🔴 Gravar
+                </button>
+            </div>
+        `;
+
+        panel.innerHTML = contentHtml;
+        addPanelStyles(panel);
+        return panel;
+    }
+
+    // Função para detectar modo escuro
+    function isDarkMode() {
+        return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    }
+
+    // Função para adicionar estilos do painel
+    function addPanelStyles(panel) {
+        const style = document.createElement('style');
+        style.textContent = `
+            .primary-btn {
+                padding: 8px;
+                background: #ff0000;
+                border: none;
+                color: white;
+                border-radius: 5px;
+                cursor: pointer;
+                transition: background 0.3s;
+                font-weight: bold;
+            }
+
+            .primary-btn:hover {
+                background: #cc0000;
+            }
+
+            .status-indicator {
+                display: flex;
+                align-items: center;
+                gap: 5px;
+                margin-bottom: 5px;
+            }
+
+            .pulse {
+                width: 10px;
+                height: 10px;
+                background: #ff0000;
+                border-radius: 50%;
+                animation: pulse 1s infinite;
+            }
+
+            @keyframes pulse {
+                0% { opacity: 1; }
+                50% { opacity: 0.5; }
+                100% { opacity: 1; }
+            }
+        `;
+        panel.appendChild(style);
+    }
+
+    // Classe para gerenciar a gravação em alta qualidade
+    class RecordingManager {
+        constructor(videoElement) {
+            this.videoElement = videoElement;
+            this.mediaRecorder = null;
+            this.chunks = [];
+            this.startTime = null;
+            this.recordingTimer = null;
+            this.currentFileSize = 0;
+            this.partCounter = 1;
+            this.settings = loadSettings();
+        }
+
+        async startRecording() {
+            try {
+                const stream = this.videoElement.captureStream();
+
+                // Configurar MediaRecorder com máxima qualidade
+                const options = {
+                    mimeType: 'video/webm;codecs=vp9',
+                    videoBitsPerSecond: this.settings.videoBitrate,
+                    audioBitsPerSecond: this.settings.audioBitrate
+                };
+
+                this.mediaRecorder = new MediaRecorder(stream, options);
+                this.setupMediaRecorderEvents();
+                this.startNewPart();
+
+                return true;
+            } catch (error) {
+                console.error('Erro ao iniciar gravação:', error);
+                return false;
+            }
+        }
+
+        setupMediaRecorderEvents() {
+            this.mediaRecorder.ondataavailable = (e) => {
+                this.chunks.push(e.data);
+                this.currentFileSize += e.data.size;
+
+                // Verificar limite de tamanho
+                if (this.settings.splitRecordingEnabled &&
+                    this.currentFileSize >= this.settings.maxFileSizeGB * 1024 * 1024 * 1024) {
+                    this.saveCurrentPart();
+                    this.startNewPart();
+                }
+            };
+
+            this.mediaRecorder.onstop = () => {
+                this.saveCurrentPart();
+                this.cleanup();
+            };
+        }
+
+        startNewPart() {
+            this.chunks = [];
+            this.currentFileSize = 0;
+            this.startTime = new Date();
+            this.mediaRecorder.start(1000);
+
+            this.updateUI('recording');
+            this.startTimer();
+        }
+
+        async saveCurrentPart() {
+            if (this.chunks.length === 0) return;
+
+            const blob = new Blob(this.chunks, { type: 'video/webm' });
+            const date = new Date().toISOString().replace(/[:.]/g, '-');
+            const fileName = `instagram-live-${date}-part${this.partCounter}.webm`;
+
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = fileName;
+            a.click();
+            URL.revokeObjectURL(url);
+
+            this.showNotification('Parte Salva',
+                `Parte ${this.partCounter} salva: ${(blob.size / (1024 * 1024)).toFixed(1)}MB`);
+
+            this.partCounter++;
+        }
+
+        cleanup() {
+            clearInterval(this.recordingTimer);
+            this.updateUI('stopped');
+            this.chunks = [];
+            this.currentFileSize = 0;
+            this.partCounter = 1;
+        }
+
+        updateUI(state) {
+            const recordingStatus = document.getElementById('recording-status');
+            const recordingTime = document.getElementById('recording-time');
+            const fileSize = document.getElementById('file-size');
+            const recordButton = document.getElementById('record-live-btn');
+
+            if (state === 'recording') {
+                recordingStatus.style.display = 'flex';
+                recordingTime.style.display = 'block';
+                fileSize.style.display = 'block';
+                recordButton.innerHTML = '⬛ Parar';
+                recordButton.style.background = '#333';
+            } else {
+                recordingStatus.style.display = 'none';
+                recordingTime.style.display = 'none';
+                fileSize.style.display = 'none';
+                recordButton.innerHTML = '🔴 Gravar';
+                recordButton.style.background = '#ff0000';
+            }
+        }
+
+        showNotification(title, message) {
+            if (this.settings.notificationsEnabled) {
+                GM_notification({
+                    title: title,
+                    text: message,
+                    timeout: 3000
+                });
+            }
+        }
+
+        startTimer() {
+            this.recordingTimer = setInterval(() => {
+                const now = new Date();
+                const diff = new Date(now - this.startTime);
+                const timeElement = document.querySelector('#recording-time span');
+                const sizeElement = document.querySelector('#file-size span');
+
+                if (timeElement) {
+                    timeElement.textContent = diff.toISOString().substr(11, 8);
+                }
+
+                if (sizeElement) {
+                    const sizeMB = this.currentFileSize / (1024 * 1024);
+                    sizeElement.textContent = `${sizeMB.toFixed(1)} MB`;
+                }
+            }, 1000);
+        }
+    }
+
+    // Inicializar
+    function initialize() {
+        const observer = new MutationObserver(() => {
+            const videoElement = document.querySelector('video');
+            if (videoElement && window.location.pathname.includes('/live/')) {
+                if (!document.getElementById('live-recorder-panel')) {
+                    const panel = createControlPanel();
+                    document.body.appendChild(panel);
+
+                    const recorder = new RecordingManager(videoElement);
+                    const recordButton = panel.querySelector('#record-live-btn');
+
+                    recordButton.addEventListener('click', () => {
+                        if (recorder.mediaRecorder && recorder.mediaRecorder.state === 'recording') {
+                            recorder.mediaRecorder.stop();
+                        } else {
+                            recorder.startRecording();
+                        }
+                    });
+
+                    if (loadSettings().autoStart) {
+                        recorder.startRecording();
+                    }
+                }
+            }
+        });
+
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+    }
+
+    // Iniciar o script
+    initialize();
+})();
